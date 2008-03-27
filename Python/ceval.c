@@ -235,7 +235,31 @@ PyEval_GetCallStats(PyObject *self)
 #endif
 #include "pythread.h"
 
-static PyThread_type_lock interpreter_lock = 0; /* This is the GIL */
+typedef void *PySpecial_cond_type;
+
+struct special_linkstruct {
+	PySpecial_cond_type wait;
+	struct special_linkstruct *queue_next, *free_next;
+	int in_use;
+};
+
+typedef void *PySpecial_lock_type;
+
+typedef struct {
+	PySpecial_lock_type the_lock;
+	struct special_linkstruct *wait_queue, *wait_last, *free_queue;
+} PySpecialSemaphore;
+
+void
+PySpecial_init(PySpecialSemaphore *s)
+{
+	s->the_lock = PyThread_mutex_alloc();
+	s->wait_queue = NULL;
+	s->wait_last = NULL;
+	s->free_queue = NULL;
+}
+
+static PySpecialSemaphore *interpreter_lock = NULL; /* This is the GIL */
 static PyThread_type_lock pending_lock = 0; /* for pending calls */
 static long main_thread = 0;
 
@@ -245,26 +269,100 @@ PyEval_ThreadsInitialized(void)
     return interpreter_lock != 0;
 }
 
+static PySpecialSemaphore *allocate_special(void)
+{
+	PySpecialSemaphore *s = malloc(sizeof(PySpecialSemaphore));
+	PySpecial_init(s);
+	return s;
+}
+
+static struct special_linkstruct *allocate_special_linkstruct(void)
+{
+	struct special_linkstruct *ls = malloc(sizeof(struct special_linkstruct));
+	ls->wait = PyThread_cond_alloc();
+	ls->queue_next = NULL;
+	ls->free_next = NULL;
+	ls->in_use = 0;
+	return ls;
+}
+
+static void PySpecial_Lock(PySpecialSemaphore *s)
+{
+	struct special_linkstruct *ls;
+
+	PyThread_mutex_lock(s->the_lock);
+
+	if (!s->free_queue)
+		s->free_queue = allocate_special_linkstruct();
+
+	ls = s->free_queue;
+	s->free_queue = ls->free_next;
+
+	if (!s->wait_queue)
+	{
+		ls->in_use = 1;
+		s->wait_queue = ls;
+		s->wait_last = ls;
+		PyThread_mutex_unlock(s->the_lock);
+		return;
+	}
+
+	assert(s->wait_queue != ls);
+	assert(s->wait_last != ls);
+	assert(s->wait_last->queue_next == NULL);
+	assert(!ls->in_use);
+	s->wait_last->queue_next = ls;
+	s->wait_last = ls;
+	ls->in_use = 1;
+
+	while (s->wait_queue != ls)
+		PyThread_cond_wait(ls->wait, s->the_lock);
+
+	PyThread_mutex_unlock(s->the_lock);
+}
+
+static void PySpecial_Unlock(PySpecialSemaphore *s)
+{
+	struct special_linkstruct *ls;
+
+	PyThread_mutex_lock(s->the_lock);
+	ls = s->wait_queue;
+	assert(ls->in_use);
+
+	s->wait_queue = ls->queue_next;
+	if (s->wait_queue)
+	{
+		ls->queue_next = NULL;
+		PyThread_cond_signal(s->wait_queue->wait);
+	}
+	ls->in_use = 0;
+
+	ls->free_next = s->free_queue;
+	s->free_queue = ls;
+
+	PyThread_mutex_unlock(s->the_lock);
+}
+
 void
 PyEval_InitThreads(void)
 {
     if (interpreter_lock)
         return;
-    interpreter_lock = PyThread_allocate_lock();
-    PyThread_acquire_lock(interpreter_lock, 1);
+    interpreter_lock = allocate_special();
+    PySpecial_Lock(interpreter_lock);
     main_thread = PyThread_get_thread_ident();
 }
 
 void
 PyEval_AcquireLock(void)
 {
-    PyThread_acquire_lock(interpreter_lock, 1);
+    PySpecial_Lock(interpreter_lock);
 }
 
 void
 PyEval_ReleaseLock(void)
 {
-    PyThread_release_lock(interpreter_lock);
+    PySpecial_Unlock(interpreter_lock);
 }
 
 void
@@ -274,7 +372,7 @@ PyEval_AcquireThread(PyThreadState *tstate)
         Py_FatalError("PyEval_AcquireThread: NULL new thread state");
     /* Check someone has called PyEval_InitThreads() to create the lock */
     assert(interpreter_lock);
-    PyThread_acquire_lock(interpreter_lock, 1);
+    PySpecial_Lock(interpreter_lock);
     if (PyThreadState_Swap(tstate) != NULL)
         Py_FatalError(
             "PyEval_AcquireThread: non-NULL old thread state");
@@ -287,7 +385,7 @@ PyEval_ReleaseThread(PyThreadState *tstate)
         Py_FatalError("PyEval_ReleaseThread: NULL thread state");
     if (PyThreadState_Swap(NULL) != tstate)
         Py_FatalError("PyEval_ReleaseThread: wrong thread state");
-    PyThread_release_lock(interpreter_lock);
+    PySpecial_Unlock(interpreter_lock);
 }
 
 /* This function is called from PyOS_AfterFork to ensure that newly
@@ -307,9 +405,9 @@ PyEval_ReInitThreads(void)
       much error-checking.  Doing this cleanly would require
       adding a new function to each thread_*.h.  Instead, just
       create a new lock and waste a little bit of memory */
-    interpreter_lock = PyThread_allocate_lock();
+    interpreter_lock = allocate_special();
     pending_lock = PyThread_allocate_lock();
-    PyThread_acquire_lock(interpreter_lock, 1);
+    PySpecial_Lock(interpreter_lock);
     main_thread = PyThread_get_thread_ident();
 
     /* Update the threading module with the new state.
@@ -343,7 +441,7 @@ PyEval_SaveThread(void)
         Py_FatalError("PyEval_SaveThread: NULL tstate");
 #ifdef WITH_THREAD
     if (interpreter_lock)
-        PyThread_release_lock(interpreter_lock);
+        PySpecial_Unlock(interpreter_lock);
 #endif
     return tstate;
 }
@@ -356,7 +454,7 @@ PyEval_RestoreThread(PyThreadState *tstate)
 #ifdef WITH_THREAD
     if (interpreter_lock) {
         int err = errno;
-        PyThread_acquire_lock(interpreter_lock, 1);
+        PySpecial_Lock(interpreter_lock);
         errno = err;
     }
 #endif
@@ -1119,20 +1217,23 @@ PyEval_EvalFrameEx(PyFrameObject *f, int throwflag)
                     _Py_Ticker = 0;
             }
 #ifdef WITH_THREAD
-            if (interpreter_lock) {
+            if (interpreter_lock && interpreter_lock->wait_queue) {
                 /* Give another thread a chance */
 
                 if (PyThreadState_Swap(NULL) != tstate)
                     Py_FatalError("ceval: tstate mix-up");
-                PyThread_release_lock(interpreter_lock);
+                PySpecial_Unlock(interpreter_lock);
 
                 /* Other threads may run now */
 
-                PyThread_acquire_lock(interpreter_lock, 1);
+                PySpecial_Lock(interpreter_lock);
 
                 if (PyThreadState_Swap(tstate) != NULL)
                     Py_FatalError("ceval: orphan tstate");
 
+            }
+
+            if (interpreter_lock) {
                 /* Check for thread interrupts */
 
                 if (tstate->async_exc != NULL) {

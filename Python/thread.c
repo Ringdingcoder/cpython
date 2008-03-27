@@ -151,6 +151,56 @@ static size_t _pythread_stacksize = 0;
 #endif
 */
 
+void *PyThread_mutex_alloc(void)
+{
+	pthread_mutex_t *m = malloc(sizeof(pthread_mutex_t));
+	if (pthread_mutex_init(m, NULL))
+		Py_FatalError("PyThread_mutex_alloc: pthread_mutex_init failed");
+	return m;
+}
+
+void PyThread_mutex_free(void *m)
+{
+	if (pthread_mutex_destroy(m))
+		Py_FatalError("PyThread_mutex_free: pthread_mutex_destroy failed");
+	free(m);
+}
+
+void PyThread_mutex_lock(void *m)
+{
+	pthread_mutex_lock(m);
+}
+
+void PyThread_mutex_unlock(void *m)
+{
+	pthread_mutex_unlock(m);
+}
+
+void *PyThread_cond_alloc(void)
+{
+	pthread_cond_t *c = malloc(sizeof(pthread_cond_t));
+	if (pthread_cond_init(c, NULL))
+		Py_FatalError("PyThread_cond_alloc: pthread_cond_init failed");
+	return c;
+}
+
+void PyThread_cond_free(void *c)
+{
+	if (pthread_cond_destroy(c))
+		Py_FatalError("PyThread_cond_free: pthread_cond_destroy failed");
+	free(c);
+}
+
+void PyThread_cond_wait(void *c, void *m)
+{
+	pthread_cond_wait(c, m);
+}
+
+void PyThread_cond_signal(void *c)
+{
+	pthread_cond_signal(c);
+}
+
 /* return the current thread stack size */
 size_t
 PyThread_get_stacksize(void)

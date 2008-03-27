@@ -34,6 +34,20 @@ PyAPI_FUNC(void) PyThread_delete_key_value(int key);
 /* Cleanup after a fork */
 PyAPI_FUNC(void) PyThread_ReInitTLS(void);
 
+#ifndef _POSIX_THREADS
+#error Requires POSIX threads
+#endif
+
+PyAPI_FUNC(void *) PyThread_mutex_alloc(void);
+PyAPI_FUNC(void) PyThread_mutex_free(void *);
+PyAPI_FUNC(void) PyThread_mutex_lock(void *);
+PyAPI_FUNC(void) PyThread_mutex_unlock(void *);
+
+PyAPI_FUNC(void *) PyThread_cond_alloc(void);
+PyAPI_FUNC(void) PyThread_cond_free(void *);
+PyAPI_FUNC(void) PyThread_cond_wait(void *, void *);
+PyAPI_FUNC(void) PyThread_cond_signal(void *);
+
 #ifdef __cplusplus
 }
 #endif
