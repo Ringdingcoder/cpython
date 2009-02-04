@@ -176,6 +176,7 @@ new_threadstate(PyInterpreterState *interp, int init)
 #else
         tstate->thread_id = 0;
 #endif
+        tstate->thread_prio = 1;
 
         tstate->dict = NULL;
 
@@ -420,6 +421,36 @@ PyThreadState_SetAsyncExc(long id, PyObject *exc) {
     }
     HEAD_UNLOCK();
     return 0;
+}
+
+long
+PyThreadState_SetOrGetPrio(long id, int get, long prio) {
+	PyThreadState *tstate = PyThreadState_GET();
+	PyInterpreterState *interp = tstate->interp;
+	PyThreadState *p;
+
+	/* Although the GIL is held, a few C API functions can be called
+	 * without the GIL held, and in particular some that create and
+	 * destroy thread and interpreter states.  Those can mutate the
+	 * list of thread states we're traversing, so to prevent that we lock
+	 * head_mutex for the duration.
+	 */
+	HEAD_LOCK();
+	for (p = interp->tstate_head; p != NULL; p = p->next) {
+		if (p->thread_id == id) {
+			if (get) {
+				prio = p->thread_prio;
+				HEAD_UNLOCK();
+				return prio;
+			} else {
+				p->thread_prio = prio;
+				HEAD_UNLOCK();
+				return 0;
+			}
+		}
+	}
+	HEAD_UNLOCK();
+	return -1;
 }
 
 

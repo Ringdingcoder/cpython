@@ -35,6 +35,7 @@ __all__ = ['activeCount', 'active_count', 'Condition', 'currentThread',
 _start_new_thread = thread.start_new_thread
 _allocate_lock = thread.allocate_lock
 _get_ident = thread.get_ident
+_set_prio = thread.set_prio
 ThreadError = thread.error
 del thread
 
@@ -645,7 +646,7 @@ class Thread(_Verbose):
     __exc_clear = _sys.exc_clear
 
     def __init__(self, group=None, target=None, name=None,
-                 args=(), kwargs=None, verbose=None):
+                 args=(), kwargs=None, verbose=None, prio=None):
         """This constructor should always be called with keyword arguments. Arguments are:
 
         *group* should be None; reserved for future extension when a ThreadGroup
@@ -675,6 +676,7 @@ class Thread(_Verbose):
         self.__name = str(name or _newname())
         self.__args = args
         self.__kwargs = kwargs
+        self.__prio = prio
         self.__daemonic = self._set_daemon()
         self.__ident = None
         self.__started = Event()
@@ -796,6 +798,9 @@ class Thread(_Verbose):
             if _profile_hook:
                 self._note("%s.__bootstrap(): registering profile hook", self)
                 _sys.setprofile(_profile_hook)
+
+            if self.__prio is not None:
+                _set_prio(_get_ident(), self.__prio)
 
             try:
                 self.run()

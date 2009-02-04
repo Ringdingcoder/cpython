@@ -245,18 +245,29 @@ struct special_linkstruct {
 
 typedef void *PySpecial_lock_type;
 
+#define PRIOS 3
+#define PRIO_OVERFLOW 10
+
 typedef struct {
 	PySpecial_lock_type the_lock;
-	struct special_linkstruct *wait_queue, *wait_last, *free_queue;
+	struct special_linkstruct *wait_queue[PRIOS], *wait_last[PRIOS], *free_queue, *current;
+	int overflow[PRIOS];
+	int max_prio;
 } PySpecialSemaphore;
 
 void
 PySpecial_init(PySpecialSemaphore *s)
 {
+	int i;
 	s->the_lock = PyThread_mutex_alloc();
-	s->wait_queue = NULL;
-	s->wait_last = NULL;
+	for (i=0; i<PRIOS; i++) {
+		s->wait_queue[i] = NULL;
+		s->wait_last[i] = NULL;
+		s->overflow[i] = 0;
+	}
 	s->free_queue = NULL;
+	s->current = NULL;
+	s->max_prio = PRIOS;
 }
 
 static PySpecialSemaphore *interpreter_lock = NULL; /* This is the GIL */
@@ -286,10 +297,54 @@ static struct special_linkstruct *allocate_special_linkstruct(void)
 	return ls;
 }
 
-static void PySpecial_Lock(PySpecialSemaphore *s)
+static struct special_linkstruct *special_pick_candidate(PySpecialSemaphore *s)
+{
+	struct special_linkstruct *next = NULL;
+
+	if (s->max_prio == PRIOS)
+		return NULL;
+
+	int m = PRIOS;
+	int p = s->max_prio;
+	for (; p<PRIOS; p++) {
+		if (s->wait_queue[p]) {
+			if (p < m)
+				m = p;
+			if (++s->overflow[p] < PRIO_OVERFLOW) {
+				next = s->wait_queue[p];
+				break;
+			}
+			while (s->overflow[p] >= PRIO_OVERFLOW)
+				s->overflow[p] -= PRIO_OVERFLOW;
+		}
+	}
+	/* might have skipped a candidate because of the overflow counters */
+	if (m < PRIOS && !next) {
+		next = s->wait_queue[m];
+		p = m;
+	}
+
+	if (next) {
+		s->current = next;
+		s->wait_queue[p] = next->queue_next;
+		next->queue_next = NULL;
+		PyThread_cond_signal(next->wait);
+	}
+
+	/* update exact max_prio */
+	for (; m<PRIOS; m++)
+		if (s->wait_queue[m])
+			break;
+	s->max_prio = m;
+
+	return next;
+}
+
+static void PySpecial_Lock(PySpecialSemaphore *s, int prio)
 {
 	struct special_linkstruct *ls;
 
+	assert(prio >= 0 && prio <= PRIOS);
 	PyThread_mutex_lock(s->the_lock);
 
 	if (!s->free_queue)
@@ -298,24 +353,44 @@ static void PySpecial_Lock(PySpecialSemaphore *s)
 	ls = s->free_queue;
 	s->free_queue = ls->free_next;
 
-	if (!s->wait_queue)
-	{
-		ls->in_use = 1;
-		s->wait_queue = ls;
-		s->wait_last = ls;
-		PyThread_mutex_unlock(s->the_lock);
-		return;
+	if (!s->current) {
+		/* lock is free, find someone to run */
+		struct special_linkstruct *next = NULL;
+		if (s->max_prio > prio && (s->max_prio == PRIOS || ++s->overflow[prio] < PRIO_OVERFLOW))
+			;
+		else {
+			while (s->overflow[prio] >= PRIO_OVERFLOW)
+				s->overflow[prio] -= PRIO_OVERFLOW;
+			/* find and schedule another candidate */
+			next = special_pick_candidate(s);
+		}
+
+		if (!next) {
+			/* noone else there - we can run */
+			assert(!ls->in_use);
+			ls->in_use = 1;
+			s->current = ls;
+			PyThread_mutex_unlock(s->the_lock);
+			return;
+		}
 	}
 
-	assert(s->wait_queue != ls);
-	assert(s->wait_last != ls);
-	assert(s->wait_last->queue_next == NULL);
-	assert(!ls->in_use);
-	s->wait_last->queue_next = ls;
-	s->wait_last = ls;
+	/* we need to wait */
+	assert(s->wait_queue[prio] != ls);
+	if (s->wait_queue[prio]) {
+		assert(s->wait_last[prio] != ls);
+		assert(s->wait_last[prio]->queue_next == NULL);
+		s->wait_last[prio]->queue_next = ls;
+		s->wait_last[prio] = ls;
+	} else {
+		s->wait_queue[prio] = ls;
+		s->wait_last[prio] = ls;
+	}
 	ls->in_use = 1;
+	if (prio < s->max_prio)
+		s->max_prio = prio;
 
-	while (s->wait_queue != ls)
+	while (s->current != ls)
 		PyThread_cond_wait(ls->wait, s->the_lock);
 
 	PyThread_mutex_unlock(s->the_lock);
@@ -323,18 +398,17 @@ static void PySpecial_Lock(PySpecialSemaphore *s)
 
 static void PySpecial_Unlock(PySpecialSemaphore *s)
 {
-	struct special_linkstruct *ls;
+	struct special_linkstruct *ls, *next;
 
 	PyThread_mutex_lock(s->the_lock);
-	ls = s->wait_queue;
+	ls = s->current;
 	assert(ls->in_use);
 
-	s->wait_queue = ls->queue_next;
-	if (s->wait_queue)
-	{
-		ls->queue_next = NULL;
-		PyThread_cond_signal(s->wait_queue->wait);
-	}
+	next = special_pick_candidate(s);
+
+	if (!next)
+		s->current = NULL;
+
 	ls->in_use = 0;
 
 	ls->free_next = s->free_queue;
@@ -349,14 +423,14 @@ PyEval_InitThreads(void)
     if (interpreter_lock)
         return;
     interpreter_lock = allocate_special();
-    PySpecial_Lock(interpreter_lock);
+    PySpecial_Lock(interpreter_lock, 0);
     main_thread = PyThread_get_thread_ident();
 }
 
 void
 PyEval_AcquireLock(void)
 {
-    PySpecial_Lock(interpreter_lock);
+    PySpecial_Lock(interpreter_lock, 1);
 }
 
 void
@@ -372,7 +446,7 @@ PyEval_AcquireThread(PyThreadState *tstate)
         Py_FatalError("PyEval_AcquireThread: NULL new thread state");
     /* Check someone has called PyEval_InitThreads() to create the lock */
     assert(interpreter_lock);
-    PySpecial_Lock(interpreter_lock);
+    PySpecial_Lock(interpreter_lock, tstate->thread_prio);
     if (PyThreadState_Swap(tstate) != NULL)
         Py_FatalError(
             "PyEval_AcquireThread: non-NULL old thread state");
@@ -407,7 +481,7 @@ PyEval_ReInitThreads(void)
       create a new lock and waste a little bit of memory */
     interpreter_lock = allocate_special();
     pending_lock = PyThread_allocate_lock();
-    PySpecial_Lock(interpreter_lock);
+    PySpecial_Lock(interpreter_lock, 0);
     main_thread = PyThread_get_thread_ident();
 
     /* Update the threading module with the new state.
@@ -454,7 +528,7 @@ PyEval_RestoreThread(PyThreadState *tstate)
 #ifdef WITH_THREAD
     if (interpreter_lock) {
         int err = errno;
-        PySpecial_Lock(interpreter_lock);
+        PySpecial_Lock(interpreter_lock, tstate->thread_prio);
         errno = err;
     }
 #endif
@@ -760,6 +834,8 @@ static int _Py_TracingPossible = 0;
    per thread, now just a pair o' globals */
 int _Py_CheckInterval = 100;
 volatile int _Py_Ticker = 0; /* so that we hit a "tick" first thing */
+int _ticker_overflow = 0;		/* for switching to higher-prio thread */
+int _ticker_overflow_lower = 0;	/* for switching to lower-prio thread */
 
 PyObject *
 PyEval_EvalCode(PyCodeObject *co, PyObject *globals, PyObject *locals)
@@ -1217,8 +1293,10 @@ PyEval_EvalFrameEx(PyFrameObject *f, int throwflag)
                     _Py_Ticker = 0;
             }
 #ifdef WITH_THREAD
-            if (interpreter_lock && interpreter_lock->wait_queue) {
-                /* Give another thread a chance */
+            if (interpreter_lock &&
+                (interpreter_lock->max_prio < tstate->thread_prio && ++_ticker_overflow < PRIO_OVERFLOW ||
+                 interpreter_lock->max_prio != PRIOS && ++_ticker_overflow_lower >= PRIO_OVERFLOW)) {
+				/* Give another thread a chance */
 
                 if (PyThreadState_Swap(NULL) != tstate)
                     Py_FatalError("ceval: tstate mix-up");
@@ -1226,14 +1304,18 @@ PyEval_EvalFrameEx(PyFrameObject *f, int throwflag)
 
                 /* Other threads may run now */
 
-                PySpecial_Lock(interpreter_lock);
+                PySpecial_Lock(interpreter_lock, tstate->thread_prio);
 
                 if (PyThreadState_Swap(tstate) != NULL)
                     Py_FatalError("ceval: orphan tstate");
 
             }
 
-            if (interpreter_lock) {
+                if (interpreter_lock) {
+                    while (_ticker_overflow >= PRIO_OVERFLOW)
+                        _ticker_overflow -= PRIO_OVERFLOW;
+                    while (_ticker_overflow_lower >= PRIO_OVERFLOW)
+                        _ticker_overflow_lower -= PRIO_OVERFLOW;
                 /* Check for thread interrupts */
 
                 if (tstate->async_exc != NULL) {

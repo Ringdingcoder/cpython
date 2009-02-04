@@ -800,6 +800,50 @@ This function is meant for internal and specialized purposes only.\n\
 In most applications `threading.enumerate()` should be used instead.");
 
 static PyObject *
+thread_get_prio(PyObject *self, PyObject *args)
+{
+	long id, prio;
+	if (!PyArg_ParseTuple(args, "l", &id))
+		return NULL;
+	prio = PyThreadState_SetOrGetPrio(id, 1, 0);
+	if (prio < 0) {
+		PyErr_SetString(ThreadError, "thread id not found");
+		return NULL;
+	}
+	return PyInt_FromLong(prio);
+}
+
+PyDoc_STRVAR(get_prio_doc,
+"get_prio(thread_id) -> int\n\
+\n\
+Returns the current scheduling priority for the thread with id\n\
+thread_id.\n");
+
+static PyObject *
+thread_set_prio(PyObject *self, PyObject *args)
+{
+	long id, prio;
+	if (!PyArg_ParseTuple(args, "ll", &id, &prio))
+		return NULL;
+	if (prio < 0 || prio > 2) {
+		PyErr_SetString(ThreadError, "invalid thread priority");
+		return NULL;
+	}
+	if (PyThreadState_SetOrGetPrio(id, 0, prio) < 0) {
+		PyErr_SetString(ThreadError, "thread id not found");
+		return NULL;
+	}
+	Py_INCREF(Py_None);
+	return Py_None;
+}
+
+PyDoc_STRVAR(set_prio_doc,
+"set_prio(thread_id, prio) -> None\n\
+\n\
+Set the scheduling priority for the thread with id thread_id.\n\
+Valid priorities are 0-2, where 0 is highest. Default is 1.\n");
+
+static PyObject *
 thread_stack_size(PyObject *self, PyObject *args)
 {
     size_t old_size;
@@ -874,6 +918,10 @@ static PyMethodDef thread_methods[] = {
      METH_NOARGS, get_ident_doc},
     {"_count",                  (PyCFunction)thread__count,
      METH_NOARGS, _count_doc},
+    {"get_prio",                (PyCFunction)thread_get_prio,
+     METH_VARARGS, get_prio_doc},
+    {"set_prio",                (PyCFunction)thread_set_prio,
+     METH_VARARGS, set_prio_doc},
     {"stack_size",              (PyCFunction)thread_stack_size,
                             METH_VARARGS,
                             stack_size_doc},

@@ -95,6 +95,8 @@ typedef struct _ts {
     PyObject *async_exc; /* Asynchronous exception to raise */
     long thread_id; /* Thread id where this tstate was created */
 
+    long thread_prio;
+
     int trash_delete_nesting;
     PyObject *trash_delete_later;
 
@@ -120,6 +122,7 @@ PyAPI_FUNC(PyThreadState *) PyThreadState_Get(void);
 PyAPI_FUNC(PyThreadState *) PyThreadState_Swap(PyThreadState *);
 PyAPI_FUNC(PyObject *) PyThreadState_GetDict(void);
 PyAPI_FUNC(int) PyThreadState_SetAsyncExc(long, PyObject *);
+PyAPI_FUNC(long) PyThreadState_SetOrGetPrio(long, int, long);
 
 
 /* Variable and macro for in-line access to current thread state */
